@@ -1,0 +1,866 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x", "linux-musl-arm64-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  ADMIN
+  VIEWER
+}
+enum DeviceStatus {
+  UNKNOWN
+  ONLINE
+  OFFLINE
+}
+enum IdentifierType {
+  MAC
+  HOSTNAME
+  SERIAL
+  MDNS_NAME
+  DHCP_CLIENT_ID
+  SNMP_SYSNAME
+  VENDOR_ID
+}
+enum AddressFamily {
+  IPV4
+  IPV6
+}
+enum CollectorStatus {
+  PENDING
+  CONNECTED
+  DISCONNECTED
+}
+enum RouterIntegrationMethod {
+  NONE
+  ICMP
+  SNMP_V2C
+  SNMP_V3
+  DLINK_HNAP
+  HTTP_PROBE
+}
+enum RouterIntegrationStatus {
+  NOT_CONFIGURED
+  CONNECTED
+  PARTIAL
+  UNSUPPORTED
+  AUTH_FAILED
+  UNREACHABLE
+}
+enum CapabilityState {
+  SUPPORTED
+  UNSUPPORTED
+  UNTESTED
+  ERROR
+}
+enum ScanStatus {
+  QUEUED
+  DISPATCHED
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+enum DiscoveryMethod {
+  ARP
+  ICMP
+  NMAP
+  DHCP
+  MANUAL
+}
+enum AlertSeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+enum AlertState {
+  OPEN
+  ACKNOWLEDGED
+  RESOLVED
+}
+
+model User {
+  id           String     @id @default(uuid()) @db.Uuid
+  email        String     @unique
+  name         String?
+  passwordHash String
+  role         UserRole   @default(ADMIN)
+  lastLoginAt  DateTime?
+  /// Bumped on "sign out everywhere" / password change / role change: older sessions are rejected.
+  sessionVersion Int      @default(0)
+  disabled     Boolean    @default(false)
+  notifications Notification[]
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+  auditLogs    AuditLog[]
+  ackAlerts    Alert[]    @relation("AlertAcknowledgedBy")
+}
+
+model Network {
+  id          String          @id @default(uuid()) @db.Uuid
+  offlineThreshold Int        @default(3)
+  /// Phase 4: seconds between collector latency/reachability probes for this network.
+  monitorIntervalSec Int      @default(60)
+  /// Phase 4: ICMP echo requests per target per probe (packet loss resolution).
+  pingCount   Int             @default(4)
+  lastMonitoredAt DateTime?
+  monitorTasks MonitorTask[]
+  latency     LatencyMeasurement[]
+  healthSnapshots NetworkHealthSnapshot[]
+  trafficSamples TrafficSample[]
+  /// Distinct network context (e.g. "isp-lan", "r15-lan"). Overlapping CIDRs are allowed only across contexts.
+  context     String          @default("default")
+  collectorLinks CollectorNetwork[]
+  routerLinks RouterNetwork[]
+  scans       ScanJob[]
+  name        String
+  cidr        String
+  parentId    String?         @db.Uuid
+  parent      Network?        @relation("Subnets", fields: [parentId], references: [id], onDelete: Cascade)
+  subnets     Network[]       @relation("Subnets")
+  vlanId      Int?
+  gateway     String?
+  description String?
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+  collectors  Collector[]
+  devices     Device[]
+  addresses   DeviceAddress[]
+  routers     Router[]
+  events      NetworkEvent[]
+  alertRules  AlertRule[]
+  @@unique([context, cidr])
+  @@index([parentId])
+}
+
+model Collector {
+  id           String              @id @default(uuid()) @db.Uuid
+  networkId    String?             @db.Uuid
+  network      Network?            @relation(fields: [networkId], references: [id], onDelete: SetNull)
+  name         String              @unique
+  tokenHash    String              @unique
+  tokenRotatedAt DateTime?
+  /// Revoked collectors are rejected on every request until a new token is issued.
+  revokedAt    DateTime?
+  status       CollectorStatus     @default(PENDING)
+  version      String?
+  hostname     String?
+  lastSeenAt   DateTime?
+  lastScanAt   DateTime?
+  lastScanStatus ScanStatus?
+  networks     CollectorNetwork[]
+  scans        ScanJob[]
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+  observations DeviceObservation[]
+  leases       DHCPLease[]
+  flows        TrafficFlow[]
+  monitorTasks MonitorTask[]
+  latency      LatencyMeasurement[]
+  trafficSources TrafficSource[]
+  @@index([networkId])
+  @@index([status])
+}
+
+/// Devices are identified by DeviceIdentifier rows, never by IP address.
+model Device {
+  id           String              @id @default(uuid()) @db.Uuid
+  networkId    String              @db.Uuid
+  network      Network             @relation(fields: [networkId], references: [id], onDelete: Cascade)
+  displayName  String?
+  hostname     String?
+  vendor       String?
+  deviceType   String?
+  category     String?
+  notes        String?
+  status       DeviceStatus        @default(UNKNOWN)
+  icmpBlocked  Boolean             @default(false)
+  consecutiveFailures Int          @default(0)
+  lastSuccessfulAt DateTime?
+  firstSeenAt  DateTime            @default(now())
+  lastSeenAt   DateTime?
+  lastCollectorId String?          @db.Uuid
+  mergedIntoId String?             @db.Uuid
+  mergedInto   Device?             @relation("DeviceMerge", fields: [mergedIntoId], references: [id], onDelete: SetNull)
+  mergedFrom   Device[]            @relation("DeviceMerge")
+  statusTransitions DeviceStatusTransition[]
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+  identifiers  DeviceIdentifier[]
+  addresses    DeviceAddress[]
+  observations DeviceObservation[]
+  metrics      DeviceMetric[]
+  leases       DHCPLease[]
+  router       Router?
+  alerts       Alert[]
+  events       NetworkEvent[]
+  latency      LatencyMeasurement[]
+  latencyRollups LatencyRollup[]
+  trafficSamples TrafficSample[]
+  @@index([networkId, status])
+  @@index([lastSeenAt])
+}
+
+model DeviceIdentifier {
+  id          String         @id @default(uuid()) @db.Uuid
+  deviceId    String         @db.Uuid
+  device      Device         @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  type        IdentifierType
+  value       String
+  confidence  Int            @default(100)
+  firstSeenAt DateTime       @default(now())
+  lastSeenAt  DateTime       @default(now())
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  @@unique([type, value])
+  @@index([deviceId])
+}
+
+/// Historical IP associations: validFrom/validTo track when a device held an address.
+model DeviceAddress {
+  id        String        @id @default(uuid()) @db.Uuid
+  deviceId  String        @db.Uuid
+  device    Device        @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  networkId String        @db.Uuid
+  network   Network       @relation(fields: [networkId], references: [id], onDelete: Cascade)
+  address   String        @db.Inet
+  family    AddressFamily @default(IPV4)
+  validFrom DateTime      @default(now())
+  validTo   DateTime?
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+  @@index([deviceId, validFrom])
+  @@index([networkId, address])
+  @@index([address, validTo])
+}
+
+model DeviceObservation {
+  id          String    @id @default(uuid()) @db.Uuid
+  deviceId    String    @db.Uuid
+  device      Device    @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  collectorId String    @db.Uuid
+  collector   Collector @relation(fields: [collectorId], references: [id], onDelete: Cascade)
+  source      String
+  method      DiscoveryMethod
+  scanJobId   String?   @db.Uuid
+  ipAddress   String?   @db.Inet
+  macAddress  String?
+  hostname    String?
+  reachable   Boolean
+  latencyMs   Float?
+  data        Json?
+  observedAt  DateTime
+  createdAt   DateTime  @default(now())
+  @@index([deviceId, observedAt])
+  @@index([collectorId, observedAt])
+  @@index([observedAt])
+}
+
+model Router {
+  id           String            @id @default(uuid()) @db.Uuid
+  networkId    String            @db.Uuid
+  network      Network           @relation(fields: [networkId], references: [id], onDelete: Cascade)
+  deviceId     String?           @unique @db.Uuid
+  device       Device?           @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+  name         String
+  manufacturer String?
+  model        String?
+  firmware     String?
+  managementIp String?           @db.Inet
+  lanIp        String?           @db.Inet
+  wanIp        String?           @db.Inet
+  wanUp        Boolean?
+  uptimeSec    BigInt?
+  status       DeviceStatus      @default(UNKNOWN)
+  integrationMethod RouterIntegrationMethod @default(ICMP)
+  integrationStatus RouterIntegrationStatus @default(NOT_CONFIGURED)
+  integrationError  String?
+  /// AES-256-GCM ciphertext (iv.tag.data, base64). Never returned by the API.
+  credentialsEnc    String?
+  pollIntervalSec   Int          @default(60)
+  consecutiveFailures Int        @default(0)
+  assignedCollectorId String?    @db.Uuid
+  lastPolledAt DateTime?
+  lastSeenAt   DateTime?
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+  interfaces   RouterInterface[]
+  leases       DHCPLease[]
+  networks     RouterNetwork[]
+  capabilities RouterCapability[]
+  metrics      RouterMetric[]
+  trafficSources TrafficSource[]
+  trafficSamples TrafficSample[]
+  @@index([networkId])
+}
+
+model RouterInterface {
+  id         String            @id @default(uuid()) @db.Uuid
+  routerId   String            @db.Uuid
+  router     Router            @relation(fields: [routerId], references: [id], onDelete: Cascade)
+  name       String
+  ifIndex    Int?
+  macAddress String?
+  speedMbps  Int?
+  isUp       Boolean?
+  /// Phase 5: WAN | LAN | OTHER. Guessed from the interface name, editable. Only WAN interfaces count toward totals (prevents double counting).
+  role       String            @default("OTHER")
+  createdAt  DateTime          @default(now())
+  updatedAt  DateTime          @updatedAt
+  metrics    InterfaceMetric[]
+  flows      TrafficFlow[]
+  trafficSamples TrafficSample[]
+  @@unique([routerId, name])
+}
+
+model DHCPLease {
+  id          String     @id @default(uuid()) @db.Uuid
+  routerId    String?    @db.Uuid
+  router      Router?    @relation(fields: [routerId], references: [id], onDelete: Cascade)
+  collectorId String?    @db.Uuid
+  collector   Collector? @relation(fields: [collectorId], references: [id], onDelete: SetNull)
+  deviceId    String?    @db.Uuid
+  device      Device?    @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+  macAddress  String
+  address     String     @db.Inet
+  hostname    String?
+  /// Phase 5: WIRED | WIRELESS when the router reports it, otherwise null (unknown).
+  connectionType String?
+  lastReportedAt DateTime?
+  leaseStart  DateTime
+  leaseEnd    DateTime?
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+  @@index([macAddress])
+  @@index([deviceId])
+  @@index([address, leaseStart])
+}
+
+model DeviceMetric {
+  id        String   @id @default(uuid()) @db.Uuid
+  deviceId  String   @db.Uuid
+  device    Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  metric    String
+  value     Float
+  unit      String?
+  timestamp DateTime
+  @@index([deviceId, metric, timestamp])
+  @@index([timestamp])
+}
+
+model InterfaceMetric {
+  id          String          @id @default(uuid()) @db.Uuid
+  interfaceId String          @db.Uuid
+  interface   RouterInterface @relation(fields: [interfaceId], references: [id], onDelete: Cascade)
+  rxBytes     BigInt?
+  txBytes     BigInt?
+  rxBps       Float?
+  txBps       Float?
+  errors      Int?
+  timestamp   DateTime
+  @@index([interfaceId, timestamp])
+}
+
+model TrafficFlow {
+  id          String           @id @default(uuid()) @db.Uuid
+  collectorId String?          @db.Uuid
+  collector   Collector?       @relation(fields: [collectorId], references: [id], onDelete: SetNull)
+  interfaceId String?          @db.Uuid
+  interface   RouterInterface? @relation(fields: [interfaceId], references: [id], onDelete: SetNull)
+  srcAddress  String           @db.Inet
+  dstAddress  String           @db.Inet
+  srcPort     Int?
+  dstPort     Int?
+  protocol    String
+  bytes       BigInt
+  packets     BigInt
+  startedAt   DateTime
+  endedAt     DateTime
+  @@index([startedAt])
+  @@index([srcAddress, startedAt])
+  @@index([dstAddress, startedAt])
+}
+
+model NetworkEvent {
+  id         String        @id @default(uuid()) @db.Uuid
+  networkId  String?       @db.Uuid
+  network    Network?      @relation(fields: [networkId], references: [id], onDelete: Cascade)
+  deviceId   String?       @db.Uuid
+  device     Device?       @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+  type       String
+  severity   AlertSeverity @default(INFO)
+  message    String
+  data       Json?
+  occurredAt DateTime      @default(now())
+  createdAt  DateTime      @default(now())
+  @@index([occurredAt])
+  @@index([type, occurredAt])
+  @@index([deviceId, occurredAt])
+  @@index([networkId, occurredAt])
+}
+
+enum AlertRuleType {
+  DEVICE_OFFLINE
+  DEVICE_ONLINE
+  ROUTER_OFFLINE
+  COLLECTOR_DISCONNECTED
+  HIGH_LATENCY
+  HIGH_PACKET_LOSS
+  HIGH_BANDWIDTH
+  NETWORK_UNAVAILABLE
+  MONITORING_FAILURE
+}
+
+model AlertRule {
+  id              String        @id @default(uuid()) @db.Uuid
+  networkId       String?       @db.Uuid
+  network         Network?      @relation(fields: [networkId], references: [id], onDelete: Cascade)
+  name            String
+  /// Null only for rules created before Phase 6 (no defined condition): they are never evaluated.
+  type            AlertRuleType?
+  /// Optional narrower scope. Null = every device/router in the network (or everywhere when networkId is null).
+  deviceId        String?       @db.Uuid
+  routerId        String?       @db.Uuid
+  /// Threshold meaning depends on type: ms (latency), 0-1 fraction (loss), bits/s (bandwidth), minutes (offline duration).
+  threshold       Float?
+  /// Lookback window used for averaged conditions (latency/loss/bandwidth).
+  windowMin       Int           @default(10)
+  evalIntervalSec Int           @default(60)
+  cooldownSec     Int           @default(900)
+  notifyEmail     Boolean       @default(true)
+  condition       Json          @default("{}")
+  severity        AlertSeverity @default(WARNING)
+  enabled         Boolean       @default(true)
+  lastEvaluatedAt DateTime?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+  alerts          Alert[]
+  @@index([enabled])
+}
+
+model Alert {
+  id               String        @id @default(uuid()) @db.Uuid
+  ruleId           String?       @db.Uuid
+  rule             AlertRule?    @relation(fields: [ruleId], references: [id], onDelete: SetNull)
+  /// rule + target; at most one non-resolved alert per fingerprint (enforced in a transaction).
+  fingerprint      String        @default("")
+  deviceId         String?       @db.Uuid
+  device           Device?       @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+  networkId        String?       @db.Uuid
+  routerId         String?       @db.Uuid
+  collectorId      String?       @db.Uuid
+  severity         AlertSeverity
+  state            AlertState    @default(OPEN)
+  title            String
+  value            Float?
+  details          Json?
+  acknowledgedById String?       @db.Uuid
+  acknowledgedBy   User?         @relation("AlertAcknowledgedBy", fields: [acknowledgedById], references: [id], onDelete: SetNull)
+  acknowledgedAt   DateTime?
+  triggeredAt      DateTime      @default(now())
+  lastSeenAt       DateTime      @default(now())
+  resolvedAt       DateTime?
+  lastNotifiedAt   DateTime?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+  notifications    Notification[]
+  @@index([state, severity])
+  @@index([triggeredAt])
+  @@index([fingerprint, state])
+  @@index([resolvedAt])
+}
+
+enum NotificationChannelType {
+  IN_APP
+  EMAIL
+  WEBHOOK
+  TELEGRAM
+  DISCORD
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+  SKIPPED
+}
+
+/// One row per configured delivery target. Config holds non-secret settings only (recipients);
+/// SMTP credentials come from the environment.
+model NotificationChannel {
+  id          String                  @id @default(uuid()) @db.Uuid
+  type        NotificationChannelType
+  name        String
+  enabled     Boolean                 @default(true)
+  minSeverity AlertSeverity           @default(WARNING)
+  config      Json                    @default("{}")
+  createdAt   DateTime                @default(now())
+  updatedAt   DateTime                @updatedAt
+  notifications Notification[]
+}
+
+model Notification {
+  id        String                  @id @default(uuid()) @db.Uuid
+  alertId   String?                 @db.Uuid
+  alert     Alert?                  @relation(fields: [alertId], references: [id], onDelete: Cascade)
+  channelId String?                 @db.Uuid
+  channel   NotificationChannel?    @relation(fields: [channelId], references: [id], onDelete: SetNull)
+  userId    String?                 @db.Uuid
+  user      User?                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      NotificationChannelType
+  kind      String                  @default("triggered")
+  title     String
+  body      String
+  status    NotificationStatus      @default(PENDING)
+  attempts  Int                     @default(0)
+  error     String?
+  readAt    DateTime?
+  sentAt    DateTime?
+  createdAt DateTime                @default(now())
+  @@index([type, readAt, createdAt])
+  @@index([status, createdAt])
+  @@index([alertId])
+}
+
+model BackupRecord {
+  id         String    @id @default(uuid()) @db.Uuid
+  fileName   String
+  sizeBytes  BigInt?
+  sha256     String?
+  status     String
+  verified   Boolean   @default(false)
+  error      String?
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+  @@index([startedAt])
+}
+
+/// Liveness written by long-running services (worker, realtime, backup) so the health page shows real state.
+model ServiceHeartbeat {
+  service   String   @id
+  version   String?
+  hostname  String?
+  startedAt DateTime
+  lastBeatAt DateTime
+  info      Json?
+}
+
+model AuditLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String?  @db.Uuid
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action    String
+  target    String?
+  ip        String?
+  userAgent String?
+  data      Json?
+  createdAt DateTime @default(now())
+  @@index([userId, createdAt])
+  @@index([action, createdAt])
+}
+
+model CollectorNetwork {
+  collectorId String    @db.Uuid
+  collector   Collector @relation(fields: [collectorId], references: [id], onDelete: Cascade)
+  networkId   String    @db.Uuid
+  network     Network   @relation(fields: [networkId], references: [id], onDelete: Cascade)
+  /// Only the primary collector runs periodic scans for a network (prevents duplicate scans).
+  isPrimary   Boolean   @default(false)
+  createdAt   DateTime  @default(now())
+  @@id([collectorId, networkId])
+}
+
+model ScanJob {
+  id            String     @id @default(uuid()) @db.Uuid
+  networkId     String     @db.Uuid
+  network       Network    @relation(fields: [networkId], references: [id], onDelete: Cascade)
+  collectorId   String?    @db.Uuid
+  collector     Collector? @relation(fields: [collectorId], references: [id], onDelete: SetNull)
+  requestedById String?    @db.Uuid
+  status        ScanStatus @default(QUEUED)
+  progress      Int        @default(0)
+  hostsTotal    Int?
+  hostsScanned  Int        @default(0)
+  devicesFound  Int        @default(0)
+  errors        Json       @default("[]")
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+  @@index([networkId, createdAt])
+  @@index([collectorId, status])
+}
+
+model DeviceStatusTransition {
+  id         String       @id @default(uuid()) @db.Uuid
+  deviceId   String       @db.Uuid
+  device     Device       @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  fromStatus DeviceStatus
+  toStatus   DeviceStatus
+  reason     String?
+  occurredAt DateTime     @default(now())
+  @@index([deviceId, occurredAt])
+}
+
+model RouterNetwork {
+  routerId  String   @db.Uuid
+  router    Router   @relation(fields: [routerId], references: [id], onDelete: Cascade)
+  networkId String   @db.Uuid
+  network   Network  @relation(fields: [networkId], references: [id], onDelete: Cascade)
+  role      String   @default("LAN") // LAN | WAN | UPSTREAM
+  createdAt DateTime @default(now())
+  @@id([routerId, networkId])
+}
+
+model RouterCapability {
+  id         String          @id @default(uuid()) @db.Uuid
+  routerId   String          @db.Uuid
+  router     Router          @relation(fields: [routerId], references: [id], onDelete: Cascade)
+  capability String
+  state      CapabilityState @default(UNTESTED)
+  detail     String?
+  checkedAt  DateTime?
+  createdAt  DateTime        @default(now())
+  updatedAt  DateTime        @updatedAt
+  @@unique([routerId, capability])
+}
+
+model RouterMetric {
+  id        String   @id @default(uuid()) @db.Uuid
+  routerId  String   @db.Uuid
+  router    Router   @relation(fields: [routerId], references: [id], onDelete: Cascade)
+  reachable Boolean
+  latencyMs Float?
+  uptimeSec BigInt?
+  clientCount Int?
+  timestamp DateTime @default(now())
+  @@index([routerId, timestamp])
+}
+
+// ---------- Phase 4: monitoring engine ----------
+
+enum MonitorTaskStatus {
+  PENDING
+  DISPATCHED
+  COMPLETED
+  EXPIRED
+}
+
+/// One probe round for a network, created by the worker and executed by the network's primary collector.
+/// `dedupeKey` (networkId:intervalBucket) prevents duplicate tasks, including across worker restarts.
+model MonitorTask {
+  id           String            @id @default(uuid()) @db.Uuid
+  networkId    String            @db.Uuid
+  network      Network           @relation(fields: [networkId], references: [id], onDelete: Cascade)
+  collectorId  String            @db.Uuid
+  collector    Collector         @relation(fields: [collectorId], references: [id], onDelete: Cascade)
+  dedupeKey    String            @unique
+  status       MonitorTaskStatus @default(PENDING)
+  targets      Json
+  pingCount    Int
+  timeoutMs    Int
+  dispatchedAt DateTime?
+  completedAt  DateTime?
+  expiresAt    DateTime
+  error        String?
+  createdAt    DateTime          @default(now())
+  measurements LatencyMeasurement[]
+  @@index([collectorId, status])
+  @@index([status, expiresAt])
+}
+
+/// Raw collector-side ICMP measurement. Never produced by the browser.
+model LatencyMeasurement {
+  id            String       @id @default(uuid()) @db.Uuid
+  deviceId      String       @db.Uuid
+  device        Device       @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  collectorId   String       @db.Uuid
+  collector     Collector    @relation(fields: [collectorId], references: [id], onDelete: Cascade)
+  networkId     String       @db.Uuid
+  network       Network      @relation(fields: [networkId], references: [id], onDelete: Cascade)
+  monitorTaskId String?      @db.Uuid
+  monitorTask   MonitorTask? @relation(fields: [monitorTaskId], references: [id], onDelete: SetNull)
+  targetIp      String       @db.Inet
+  sent          Int
+  received      Int
+  minMs         Float?
+  avgMs         Float?
+  maxMs         Float?
+  /// 0..1
+  packetLoss    Float
+  measuredAt    DateTime
+  createdAt     DateTime     @default(now())
+  @@index([deviceId, measuredAt])
+  @@index([networkId, measuredAt])
+  @@index([measuredAt])
+}
+
+/// Hourly per-device aggregate of LatencyMeasurement (charts read these, not raw rows).
+model LatencyRollup {
+  id          String   @id @default(uuid()) @db.Uuid
+  deviceId    String   @db.Uuid
+  device      Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  networkId   String   @db.Uuid
+  bucketStart DateTime
+  samples     Int
+  upSamples   Int
+  avgMs       Float?
+  minMs       Float?
+  maxMs       Float?
+  packetLoss  Float
+  @@unique([deviceId, bucketStart])
+  @@index([networkId, bucketStart])
+  @@index([bucketStart])
+}
+
+/// Periodic health snapshot. networkId = null is the all-networks summary.
+model NetworkHealthSnapshot {
+  id              String   @id @default(uuid()) @db.Uuid
+  networkId       String?  @db.Uuid
+  network         Network? @relation(fields: [networkId], references: [id], onDelete: Cascade)
+  takenAt         DateTime @default(now())
+  devicesTotal    Int
+  online          Int
+  offline         Int
+  unknown         Int
+  routersTotal    Int
+  routersUp       Int
+  collectorsTotal Int
+  collectorsUp    Int
+  avgLatencyMs    Float?
+  packetLoss      Float?
+  /// 0..100, null when there is not enough data
+  healthScore     Float?
+  @@index([networkId, takenAt])
+  @@index([takenAt])
+}
+
+/// Every failed BullMQ attempt or expired monitoring task.
+model JobFailure {
+  id           String   @id @default(uuid()) @db.Uuid
+  queue        String
+  jobName      String
+  jobId        String?
+  attemptsMade Int      @default(0)
+  final        Boolean  @default(false)
+  error        String
+  data         Json?
+  failedAt     DateTime @default(now())
+  @@index([failedAt])
+  @@index([queue, failedAt])
+}
+
+
+// ---------- Phase 5: topology layout + traffic analytics ----------
+
+enum TrafficSourceKind {
+  SNMP_IF_COUNTERS
+  ROUTER_CLIENT_STATS
+  NETFLOW_V5
+  IPFIX
+  SFLOW
+  PACKET_CAPTURE
+}
+enum TrafficSourceStatus {
+  ACTIVE
+  STALE
+  UNSUPPORTED
+  DISABLED
+  ERROR
+}
+enum TrafficScope {
+  INTERFACE
+  DEVICE
+}
+
+/// User-moved node positions. nodeId is the topology node id (e.g. "device:<uuid>"). Absent = automatic layout.
+model TopologyNodePosition {
+  nodeId    String   @id
+  x         Float
+  y         Float
+  updatedAt DateTime @updatedAt
+}
+
+/// A place traffic numbers come from. perDevice = true only for kinds that identify individual hosts.
+model TrafficSource {
+  id           String              @id @default(uuid()) @db.Uuid
+  kind         TrafficSourceKind
+  name         String
+  /// Unique per kind: "router:<id>", "collector:<id>:<exporterIp>"
+  sourceKey    String
+  routerId     String?             @db.Uuid
+  router       Router?             @relation(fields: [routerId], references: [id], onDelete: Cascade)
+  collectorId  String?             @db.Uuid
+  collector    Collector?          @relation(fields: [collectorId], references: [id], onDelete: Cascade)
+  perDevice    Boolean             @default(false)
+  status       TrafficSourceStatus @default(ACTIVE)
+  detail       String?
+  lastSampleAt DateTime?
+  /// Last cumulative counters per client MAC (ROUTER_CLIENT_STATS) so deltas survive worker restarts.
+  state        Json?
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+  samples      TrafficSample[]
+  @@unique([kind, sourceKey])
+}
+
+/// One measured interval. Byte counts are deltas for [measuredAt - intervalSec, measuredAt]; never cumulative counters.
+/// "download" = towards the network/device, "upload" = away from it. No packet payloads are ever stored.
+model TrafficSample {
+  id            String           @id @default(uuid()) @db.Uuid
+  sourceId      String           @db.Uuid
+  source        TrafficSource    @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  scope         TrafficScope
+  interfaceId   String?          @db.Uuid
+  interface     RouterInterface? @relation(fields: [interfaceId], references: [id], onDelete: Cascade)
+  deviceId      String?          @db.Uuid
+  device        Device?          @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  routerId      String?          @db.Uuid
+  router        Router?          @relation(fields: [routerId], references: [id], onDelete: SetNull)
+  networkId     String?          @db.Uuid
+  network       Network?         @relation(fields: [networkId], references: [id], onDelete: SetNull)
+  /// Only WAN-interface and per-device samples count toward totals; LAN/OTHER interface samples are kept for utilisation.
+  countsTowardTotal Boolean      @default(false)
+  downloadBytes BigInt
+  uploadBytes   BigInt
+  downloadBps   Float
+  uploadBps     Float
+  /// 0..1, only when interface speed is known
+  utilization   Float?
+  intervalSec   Float
+  measuredAt    DateTime
+  @@index([measuredAt])
+  @@index([deviceId, measuredAt])
+  @@index([networkId, measuredAt])
+  @@index([routerId, measuredAt])
+  @@index([interfaceId, measuredAt])
+  @@index([sourceId, measuredAt])
+}
+
+/// Hourly aggregate of TrafficSample. key = "<scope>:<deviceId|interfaceId>:<sourceId>".
+model TrafficRollup {
+  id            String       @id @default(uuid()) @db.Uuid
+  key           String
+  scope         TrafficScope
+  sourceId      String       @db.Uuid
+  deviceId      String?      @db.Uuid
+  interfaceId   String?      @db.Uuid
+  routerId      String?      @db.Uuid
+  networkId     String?      @db.Uuid
+  countsTowardTotal Boolean
+  bucketStart   DateTime
+  downloadBytes BigInt
+  uploadBytes   BigInt
+  maxDownloadBps Float
+  maxUploadBps  Float
+  samples       Int
+  @@unique([key, bucketStart])
+  @@index([bucketStart])
+  @@index([deviceId, bucketStart])
+  @@index([networkId, bucketStart])
+  @@index([routerId, bucketStart])
+}

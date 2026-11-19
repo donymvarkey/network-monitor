@@ -1,0 +1,11 @@
+node_modules
+.next
+dist
+.env
+.env.collector
+
+# Phase 6
+backups/
+*.dump
+*.dump.sha256
+docker/nginx/certs/*.pem

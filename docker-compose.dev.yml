@@ -1,0 +1,19 @@
+# Local development overrides: exposes Postgres, Redis and realtime on localhost only,
+# so the web app can run on your machine with `pnpm dev`.
+#
+# THIS FILE IS AN OVERRIDE LAYER, NOT A STANDALONE COMPOSE FILE.
+# It only adds port mappings; the images, environment and volumes live in
+# docker-compose.yml. Running this file alone fails with
+#   service "redis" has neither an image nor a build context specified: invalid compose project
+# Always pass both files, in this order:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml <command>
+services:
+  postgres:
+    ports: ["127.0.0.1:5432:5432"]
+  redis:
+    ports: ["127.0.0.1:6379:6379"]
+  realtime:
+    ports: ["127.0.0.1:4001:4001"]
+  # Dev: nginx is not used (web runs on the host); keep it from binding ports.
+  nginx:
+    profiles: ["prod-only"]

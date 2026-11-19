@@ -1,0 +1,1 @@
+{ "name": "@netmon/router-adapters", "version": "0.1.0", "main": "src/index.ts", "types": "src/index.ts", "peerDependencies": { "@prisma/client": "^5.22.0" }, "dependencies": { "@netmon/network-core": "workspace:*", "net-snmp": "^3.14.0" }, "devDependencies": { "@types/net-snmp": "^3.8.0" } }
